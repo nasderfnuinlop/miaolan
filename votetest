@@ -1,0 +1,118 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.0;
+
+import "@openzeppelin/contracts/utils/StorageSlot.sol";
+
+contract VotingSystemProxy {
+    bytes32 private constant IMPLEMENTATION_SLOT = 
+        bytes32(uint256(keccak256("eip1967.proxy.implementation")) - 1);
+    bytes32 private constant ADMIN_SLOT = 
+        bytes32(uint256(keccak256("eip1967.proxy.admin")) - 1);
+
+    event Upgraded(address indexed implementation);
+
+    constructor(address _implementation) {
+        _setAdmin(msg.sender);
+        _setImplementation(_implementation);
+    }
+
+    modifier onlyAdmin() {
+        require(msg.sender == _getAdmin(), "Caller is not the admin");
+        _;
+    }
+
+    function _getAdmin() internal view returns (address) {
+        return StorageSlot.getAddressSlot(ADMIN_SLOT).value;
+    }
+
+    function _setAdmin(address _admin) private {
+        require(_admin != address(0), "Admin address cannot be zero");
+        StorageSlot.getAddressSlot(ADMIN_SLOT).value = _admin;
+    }
+
+    function _getImplementation() internal view returns (address) {
+        return StorageSlot.getAddressSlot(IMPLEMENTATION_SLOT).value;
+    }
+
+    function _setImplementation(address _implementation) private {
+        require(_implementation != address(0), "Implementation address cannot be zero");
+        StorageSlot.getAddressSlot(IMPLEMENTATION_SLOT).value = _implementation;
+    }
+
+    function upgradeTo(address _implementation) external onlyAdmin {
+        _setImplementation(_implementation);
+        emit Upgraded(_implementation);
+    }
+
+
+    function admin() external view returns (address) {
+        return _getAdmin();
+    }
+
+    function implementation() external view returns (address) {
+        return _getImplementation();
+    }
+
+    fallback() external payable {
+        address impl = _getImplementation();
+        require(impl != address(0), "Implementation not set");
+        
+        assembly {
+            // 分配内存空间
+            let ptr := mload(0x40)
+            // 复制calldata到内存
+            calldatacopy(ptr, 0, calldatasize())
+            
+            // 执行delegatecall
+            let result := delegatecall(
+                gas(),        // 传递所有gas
+                impl,        // 实现合约地址
+                ptr,         // 输入数据指针
+                calldatasize(), // 输入数据大小
+                0,           // 输出数据指针(暂时设为0)
+                0            // 输出数据大小(暂时设为0)
+            )
+            
+            // 获取返回数据大小
+            let size := returndatasize()
+            
+            // 复制返回数据到内存
+            returndatacopy(ptr, 0, size)
+            
+            switch result
+            case 0 {
+                // 调用失败，revert返回数据
+                revert(ptr, size)
+            }
+            default {
+                // 调用成功，返回数据
+                return(ptr, size)
+            }
+        }
+    }
+
+    receive() external payable {
+        _fallback();
+    }
+    
+    function _fallback() internal {
+        address impl = _getImplementation();
+        require(impl != address(0), "Implementation not set");
+        
+        assembly {
+            let ptr := mload(0x40)
+            calldatacopy(ptr, 0, calldatasize())
+            let result := delegatecall(gas(), impl, ptr, calldatasize(), 0, 0)
+            let size := returndatasize()
+            returndatacopy(ptr, 0, size)
+            
+            switch result
+            case 0 {
+                revert(ptr, size)
+            }
+            default {
+                return(ptr, size)
+            }
+        }
+    }
+}
