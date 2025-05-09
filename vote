@@ -1,0 +1,316 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.0;
+
+import "@openzeppelin/contracts/access/AccessControl.sol";
+import "@openzeppelin/contracts/access/Ownable.sol";
+
+contract VotingSystem is Ownable, AccessControl {
+    bytes32 public constant CHAIRPERSON_ROLE = keccak256("CHAIRPERSON_ROLE");
+    bytes32 public constant ADMIN_ROLE = keccak256("ADMIN_ROLE");
+
+    enum VoteType { NORMAL, OFFICIAL }
+
+    struct Proposal {
+        bytes32 name;
+        uint voteCount;
+        mapping(address => uint) voterWeights;
+    }
+
+    struct VotingSession {
+        address creator;
+        string name;
+        VoteType voteType;
+        Proposal[] proposals;
+        uint startTime;
+        uint endTime;
+        bool opening;
+        bool isClosed;
+        uint totalVotes;
+    }
+
+    VotingSession[] public votingSessions;
+    mapping(address => uint[]) public userCreatedVotes;
+    mapping(address => mapping(uint => bool)) public voterPermissions;
+
+    mapping(bytes32 => address[]) private roleMembers;
+
+    event VoteCreated(uint voteId, address creator, string name, VoteType voteType);
+    event Voted(uint voteId, address voter, uint proposalIndex, uint voteWeight);
+    event VoteClosed(uint voteId);
+    event VoteOpening(uint voteId);
+    event VoterPermissionGranted(uint voteId, address voter);
+
+    struct ProposalView {
+        uint voteId;
+        uint proposalIndex;
+        bytes32 name;
+       
+        uint yourVoteWeight;
+        VoteType voteType;
+    }
+
+    // 在构造函数中显式调用 Ownable 的构造函数
+    constructor() Ownable(msg.sender) {
+        _grantRole(DEFAULT_ADMIN_ROLE, msg.sender); // Grant default admin role
+        _grantRole(ADMIN_ROLE, msg.sender); // Grant admin role
+        _setRoleAdmin(CHAIRPERSON_ROLE, ADMIN_ROLE); // Set admin role as the admin of chairperson role
+    }
+
+    function grantChairperson(address account) public onlyRole(ADMIN_ROLE) {
+        _grantRole(CHAIRPERSON_ROLE, account);
+        roleMembers[CHAIRPERSON_ROLE].push(account);
+    }
+
+    function revokeChairperson(address account) public onlyRole(ADMIN_ROLE) {
+        _revokeRole(CHAIRPERSON_ROLE, account);
+        _removeFromRole(CHAIRPERSON_ROLE, account);
+    }
+
+    function grantAdmin(address account) public onlyRole(DEFAULT_ADMIN_ROLE) {
+        _grantRole(ADMIN_ROLE, account);
+        roleMembers[ADMIN_ROLE].push(account);
+    }
+
+    function getRoleMembers(bytes32 role) public view returns (address[] memory) {
+        return roleMembers[role];
+    }
+
+    function _removeFromRole(bytes32 role, address account) internal {
+        address[] storage members = roleMembers[role];
+        for (uint256 i = 0; i < members.length; i++) {
+            if (members[i] == account) {
+                members[i] = members[members.length - 1];
+                members.pop();
+                break;
+            }
+        }
+    }
+
+    function grantVoterPermission(uint voteId, address voter) external {
+        require(voteId < votingSessions.length, "Invalid vote ID");
+        VotingSession storage session = votingSessions[voteId];
+        
+        require(
+            msg.sender == session.creator || 
+            hasRole(CHAIRPERSON_ROLE, msg.sender) || 
+            hasRole(ADMIN_ROLE, msg.sender),
+            "No permission to grant voting right"
+        );
+        
+        voterPermissions[voter][voteId] = true;
+        emit VoterPermissionGranted(voteId, voter);
+    }
+    // 创建投票 - 管理员创建
+function createAdminVote(
+    string memory name,
+    bytes32[] memory proposalNames,
+    uint startTime,
+    uint endTime
+) external onlyRole(ADMIN_ROLE) {
+    _createVote(name, proposalNames, startTime, endTime, VoteType.OFFICIAL);
+}
+
+// 内部创建投票函数
+function _createVote(
+    string memory name,
+    bytes32[] memory proposalNames,
+    uint startTime,
+    uint endTime,
+    VoteType voteType
+) internal {
+    require(startTime < endTime, "End time must be after start time");
+
+    VotingSession storage newSession = votingSessions.push();
+    newSession.creator = msg.sender;
+    newSession.name = name;
+    newSession.voteType = voteType;
+    newSession.startTime = startTime;
+    newSession.endTime = endTime;
+    newSession.opening = true;
+    newSession.isClosed = false;
+    newSession.totalVotes = 0;
+
+    for (uint i = 0; i < proposalNames.length; i++) {
+        newSession.proposals.push();
+        Proposal storage p = newSession.proposals[i];
+        p.name = proposalNames[i];
+        p.voteCount = 0;
+    }
+
+    uint voteId = votingSessions.length - 1;
+    userCreatedVotes[msg.sender].push(voteId);
+    
+    // 根据投票类型自动分配权限
+    if (voteType == VoteType.OFFICIAL) {
+        address[] memory admins = getRoleMembers(ADMIN_ROLE);
+        for (uint i = 0; i < admins.length; i++) {
+            voterPermissions[admins[i]][voteId] = true;
+        }
+        address[] memory chairs = getRoleMembers(CHAIRPERSON_ROLE);
+        for (uint i = 0; i < chairs.length; i++) {
+            voterPermissions[chairs[i]][voteId] = true;
+        }
+    }
+    
+    emit VoteCreated(voteId, msg.sender, name, voteType);
+}
+
+    function castVote(uint voteId, bytes32 proposalName, uint voteWeight) external 
+        returns (uint proposalIndex, uint yourVoteWeight) 
+    {
+        require(voteId < votingSessions.length, "Invalid vote ID");
+        VotingSession storage session = votingSessions[voteId];
+        
+        require(session.opening, "Vote is not open");
+        require(!session.isClosed, "Vote is already closed");
+        require(voteWeight > 0, "Vote weight must be positive");
+        require(
+            voterPermissions[msg.sender][voteId] || 
+            session.voteType == VoteType.NORMAL,
+            "No permission to vote"
+        );
+
+        proposalIndex = findProposalIndexByName(voteId, proposalName);
+        require(proposalIndex != type(uint).max, "Invalid proposal name");
+
+        Proposal storage proposal = session.proposals[proposalIndex];
+        proposal.voteCount += voteWeight;
+        proposal.voterWeights[msg.sender] += voteWeight;
+        session.totalVotes += voteWeight;
+
+        yourVoteWeight = proposal.voterWeights[msg.sender];
+        
+        emit Voted(voteId, msg.sender, proposalIndex, voteWeight);
+        return (proposalIndex, yourVoteWeight);
+    }
+
+    function findProposalIndexByName(uint voteId, bytes32 proposalName) public view returns (uint) {
+        require(voteId < votingSessions.length, "Invalid vote ID");
+        VotingSession storage session = votingSessions[voteId];
+        
+        for (uint i = 0; i < session.proposals.length; i++) {
+            if (session.proposals[i].name == proposalName) {
+                return i;
+            }
+        }
+        return type(uint).max;
+    }
+
+    function closeVote(uint voteId) external returns (uint winningProposalIndex, uint winningVoteWeight) {
+        require(voteId < votingSessions.length, "Invalid vote ID");
+        VotingSession storage session = votingSessions[voteId];
+        require(msg.sender == session.creator, "Only creator can close the vote");
+        require(!session.isClosed, "Vote is already closed");
+
+        session.isClosed = true;
+        emit VoteClosed(voteId);
+
+        uint maxVotes = 0;
+        winningProposalIndex = 0;
+        for (uint i = 0; i < session.proposals.length; i++) {
+            if (session.proposals[i].voteCount > maxVotes) {
+                maxVotes = session.proposals[i].voteCount;
+                winningProposalIndex = i;
+            }
+        }
+
+        winningVoteWeight = maxVotes;
+        return (winningProposalIndex, winningVoteWeight);
+    }
+
+  function getWinningProposal(uint voteId) external view 
+    returns (uint proposalIndex, bytes32 name, uint winningVoteWeight) 
+{
+    require(voteId < votingSessions.length, "Invalid vote ID");
+    VotingSession storage session = votingSessions[voteId];
+    require(session.isClosed, "Vote is not closed yet");
+
+    uint maxVotes = 0;
+    proposalIndex = 0;
+    
+    // 遍历所有提案找出票数最高的
+    for (uint i = 0; i < session.proposals.length; i++) {
+        if (session.proposals[i].voteCount > maxVotes) {
+            maxVotes = session.proposals[i].voteCount;
+            proposalIndex = i;
+        }
+    }
+
+    name = session.proposals[proposalIndex].name;
+    winningVoteWeight = maxVotes;
+    
+    return (proposalIndex, name, winningVoteWeight);
+}
+     // 查询主席已投票的提案
+    function getVotedProposalsForChairperson(address chairperson) external view 
+        returns (ProposalView[] memory) 
+    {
+        require(hasRole(CHAIRPERSON_ROLE, chairperson), "Address is not a chairperson");
+
+        uint count = 0;
+        for (uint i = 0; i < votingSessions.length; i++) {
+            VotingSession storage session = votingSessions[i];
+            for (uint j = 0; j < session.proposals.length; j++) {
+                if (session.proposals[j].voterWeights[chairperson] > 0) {
+                    count++;
+                }
+            }
+        }
+
+        ProposalView[] memory votedProposals = new ProposalView[](count);
+        uint index = 0;
+        for (uint i = 0; i < votingSessions.length; i++) {
+            VotingSession storage session = votingSessions[i];
+            for (uint j = 0; j < session.proposals.length; j++) {
+                Proposal storage proposal = session.proposals[j];
+                if (proposal.voterWeights[chairperson] > 0) {
+                    votedProposals[index++] = ProposalView({
+                        voteId: i,
+                        proposalIndex: j,
+                        name: proposal.name,
+                       
+                        yourVoteWeight: proposal.voterWeights[chairperson],
+                        voteType: session.voteType
+                    });
+                }
+            }
+        }
+        return votedProposals;
+    }
+
+    // 查询主席未投票的提案
+    function getUnvotedProposalsForChairperson(address chairperson) external view 
+        returns (ProposalView[] memory) 
+    {
+        require(hasRole(CHAIRPERSON_ROLE, chairperson), "Address is not a chairperson");
+
+        uint count = 0;
+        for (uint i = 0; i < votingSessions.length; i++) {
+            VotingSession storage session = votingSessions[i];
+            for (uint j = 0; j < session.proposals.length; j++) {
+                if (session.proposals[j].voterWeights[chairperson] == 0) {
+                    count++;
+                }
+            }
+        }
+
+        ProposalView[] memory unvotedProposals = new ProposalView[](count);
+        uint index = 0;
+        for (uint i = 0; i < votingSessions.length; i++) {
+            VotingSession storage session = votingSessions[i];
+            for (uint j = 0; j < session.proposals.length; j++) {
+                Proposal storage proposal = session.proposals[j];
+                if (proposal.voterWeights[chairperson] == 0) {
+                    unvotedProposals[index++] = ProposalView({
+                        voteId: i,
+                        proposalIndex: j,
+                        name: proposal.name,
+                        yourVoteWeight: proposal.voterWeights[chairperson],
+                        voteType: session.voteType
+                    });
+                }
+            }
+        }
+        return unvotedProposals;
+    }
+}
